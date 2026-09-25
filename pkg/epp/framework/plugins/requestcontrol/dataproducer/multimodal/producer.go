@@ -24,12 +24,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
-	lru "github.com/hashicorp/golang-lru/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/llm-d/llm-d-router/pkg/common/observability/logging"
@@ -60,17 +60,21 @@ var (
 	// ProducedKey is the data key emitted by this producer.
 	ProducedKey = attrmm.EncoderCacheMatchInfoKey
 
-	_ requestcontrol.DataProducer = &Producer{}
-	_ requestcontrol.PreRequest   = &Producer{}
-	_ fwkdl.EndpointExtractor     = &Producer{}
-	_ plugin.ConsumerPlugin       = &Producer{}
-	_ plugin.StateDumper          = &Producer{}
+	_ requestcontrol.DataProducer          = &Producer{}
+	_ requestcontrol.PreRequest            = &Producer{}
+	_ requestcontrol.ResponseBodyProcessor = &Producer{}
+	_ fwkdl.EndpointExtractor              = &Producer{}
+	_ plugin.ConsumerPlugin                = &Producer{}
+	_ plugin.StateDumper                   = &Producer{}
 )
 
 // Parameters configures the multimodal encoder-cache data producer.
 type Parameters struct {
 	// CacheSizeInMBPerServer is the per-endpoint LRU memory budget in mebibytes (MiB).
 	CacheSizeInMBPerServer int `json:"cacheSizeInMBPerServer"`
+	// CacheSizeInEmbeddingsPerServer is the per-endpoint encoder-cache capacity
+	// measured in encoder output embeddings, matching vLLM's encoder cache unit.
+	CacheSizeInEmbeddingsPerServer int `json:"cacheSizeInEmbeddingsPerServer"`
 }
 
 // lruCapacityFromCacheSizeMB converts a MiB budget to a maximum LRU entry count.
@@ -101,17 +105,17 @@ func Factory(name string, rawParameters *json.Decoder, handle plugin.Handle) (pl
 }
 
 // Producer tracks multimodal content hashes and the pods that likely hold their
-// encoder-cache entries. Each pod has its own LRU cache of hashes, so eviction
-// is scoped per endpoint rather than global.
+// encoder-cache entries. Each pod has its own capacity and request references,
+// so allocation and eviction are scoped per endpoint rather than global.
 type Producer struct {
 	typedName   plugin.TypedName
 	dk          plugin.DataKey
-	caches      map[string]*lru.Cache[string, struct{}]
+	caches      map[string]*podCache
 	cacheSize   int
+	useItemSize bool
 	pluginState *plugin.PluginState
 	podList     func() []k8stypes.NamespacedName
 	mutex       sync.RWMutex
-	wg          sync.WaitGroup
 }
 
 type requestState struct {
@@ -128,18 +132,28 @@ func (s *requestState) Clone() plugin.StateData {
 // New creates a Producer.
 func New(ctx context.Context, name string, params *Parameters, podList func() []k8stypes.NamespacedName) (*Producer, error) {
 	cacheSizeMB := 0
+	cacheSizeEmbeddings := 0
 	if params != nil {
 		cacheSizeMB = params.CacheSizeInMBPerServer
+		cacheSizeEmbeddings = params.CacheSizeInEmbeddingsPerServer
 	}
-	cacheSize := lruCapacityFromCacheSizeMB(cacheSizeMB)
+	if cacheSizeMB > 0 && cacheSizeEmbeddings > 0 {
+		return nil, errors.New("cacheSizeInMBPerServer and cacheSizeInEmbeddingsPerServer cannot both be set")
+	}
+	cacheSize := cacheSizeEmbeddings
+	useItemSize := cacheSizeEmbeddings > 0
+	if !useItemSize {
+		cacheSize = lruCapacityFromCacheSizeMB(cacheSizeMB)
+	}
 
 	registerEncoderCacheMetrics()
 
 	p := &Producer{
 		typedName:   plugin.TypedName{Type: ProducerType, Name: name},
 		dk:          attrmm.EncoderCacheMatchInfoKey.WithNonEmptyProducerName(name),
-		caches:      make(map[string]*lru.Cache[string, struct{}]),
+		caches:      make(map[string]*podCache),
 		cacheSize:   cacheSize,
+		useItemSize: useItemSize,
 		pluginState: plugin.NewPluginState(ctx),
 		podList:     podList,
 	}
@@ -149,13 +163,13 @@ func New(ctx context.Context, name string, params *Parameters, podList func() []
 	return p, nil
 }
 
-// getOrCreatePodCache returns the LRU cache for the given pod, creating one if absent.
+// getOrCreatePodCache returns the encoder cache for the given pod, creating one if absent.
 // Must be called with p.mutex held for write.
-func (p *Producer) getOrCreatePodCache(pod string) *lru.Cache[string, struct{}] {
+func (p *Producer) getOrCreatePodCache(pod string) *podCache {
 	if c, ok := p.caches[pod]; ok {
 		return c
 	}
-	c, _ := lru.New[string, struct{}](p.cacheSize)
+	c := newPodCache(p.cacheSize)
 	p.caches[pod] = c
 	return c
 }
@@ -232,7 +246,7 @@ func (p *Producer) DumpState() (json.RawMessage, error) {
 	}
 	pods := make([]podItemCount, 0, len(p.caches))
 	for pod, cache := range p.caches {
-		pods = append(pods, podItemCount{Pod: pod, Items: cache.Len()})
+		pods = append(pods, podItemCount{Pod: pod, Items: cache.len()})
 	}
 	p.mutex.RUnlock()
 
@@ -415,8 +429,7 @@ func itemSlice(itemsByHash map[string]attrmm.MatchItem) []attrmm.MatchItem {
 }
 
 // recordItemLookups increments the queries counter for each item and, for every
-// endpoint whose LRU contains the hash, increments that endpoint's hits counter.
-// Contains is used instead of Get to avoid altering recency during a read-only path.
+// endpoint whose cache contains the hash, increments that endpoint's hits counter.
 func (p *Producer) recordItemLookups(items []attrmm.MatchItem) {
 	p.mutex.RLock()
 	defer p.mutex.RUnlock()
@@ -424,7 +437,7 @@ func (p *Producer) recordItemLookups(items []attrmm.MatchItem) {
 	for _, item := range items {
 		encoderCacheQueriesTotal.WithLabelValues(pluginType, pluginName, item.Modality).Inc()
 		for pod, podCache := range p.caches {
-			if podCache.Contains(item.Hash) {
+			if podCache.contains(item.Hash) {
 				encoderCacheHitsTotal.WithLabelValues(pluginType, pluginName, pod, item.Modality).Inc()
 			}
 		}
@@ -432,7 +445,7 @@ func (p *Producer) recordItemLookups(items []attrmm.MatchItem) {
 }
 
 // recordHitRatio observes the fraction of a request's multimodal items that
-// matched a single endpoint's LRU. A zero total is not a meaningful ratio and
+// matched a single endpoint's cache. A zero total is not a meaningful ratio and
 // is not observed.
 func (p *Producer) recordHitRatio(matchedItems, totalItems int) {
 	if totalItems == 0 {
@@ -451,7 +464,7 @@ func (p *Producer) matchedItemsForPod(pod string, requestItems []attrmm.MatchIte
 	}
 	matchedItemsByHash := map[string]attrmm.MatchItem{}
 	for _, item := range requestItems {
-		if podCache.Contains(item.Hash) {
+		if podCache.contains(item.Hash) {
 			matchedItemsByHash[item.Hash] = item
 		}
 	}

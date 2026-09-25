@@ -23,6 +23,7 @@ import (
 	"reflect"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,6 +31,7 @@ import (
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requestcontrol"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	attrmm "github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/datalayer/attribute/multimodal"
@@ -63,6 +65,20 @@ func TestFactory(t *testing.T) {
 	consumes := producer.Consumes()
 	assert.Empty(t, consumes.Required)
 	assert.Contains(t, consumes.Optional, tokenproducer.TokenizedPromptDataKey)
+
+	weightedRaw, err := json.Marshal(map[string]any{"cacheSizeInEmbeddingsPerServer": 1024})
+	require.NoError(t, err)
+	weightedPlugin, err := Factory("weighted", plugin.StrictDecoder(weightedRaw), &testHandle{ctx: context.Background()})
+	require.NoError(t, err)
+	weightedProducer := weightedPlugin.(*Producer)
+	assert.Equal(t, 1024, weightedProducer.cacheSize)
+	assert.True(t, weightedProducer.useItemSize)
+
+	_, err = Factory("ambiguous", plugin.StrictDecoder(json.RawMessage(`{
+		"cacheSizeInMBPerServer": 4,
+		"cacheSizeInEmbeddingsPerServer": 1024
+	}`)), &testHandle{ctx: context.Background()})
+	require.ErrorContains(t, err, "cannot both be set")
 }
 
 func TestExtractMMItemsFromTokenizedRequestUsesPlaceholderLengths(t *testing.T) {
@@ -227,7 +243,7 @@ func TestProduceMatchesMultiplePodsAndPreRequestUpdatesPlacement(t *testing.T) {
 		[]attrmm.MatchItem{{Hash: "hash-a", Size: 80, Modality: img}, {Hash: "hash-c", Size: 20, Modality: img}})
 
 	_ = producer.PreRequest(context.Background(), request, schedulingResult(endpointC))
-	producer.wg.Wait()
+	producer.ResponseBody(context.Background(), request, &requestcontrol.Response{StartOfStream: true}, endpointC.GetMetadata())
 
 	cache := producer.cacheSnapshot()
 	assert.Contains(t, cache["hash-a"], podA.String())
@@ -244,13 +260,188 @@ func TestLRUEviction(t *testing.T) {
 		request := requestWithHashes(hash, map[string]int{hash: 1})
 		require.NoError(t, producer.Produce(context.Background(), request, []scheduling.Endpoint{endpoint}))
 		_ = producer.PreRequest(context.Background(), request, schedulingResult(endpoint))
-		producer.wg.Wait()
+		producer.ResponseBody(context.Background(), request, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
 	}
 
 	cache := producer.cacheSnapshot()
 	assert.NotContains(t, cache, "hash-1")
 	assert.Contains(t, cache, "hash-2")
 	assert.Contains(t, cache, "hash-3")
+}
+
+func TestWeightedEvictionUsesEncoderEmbeddingCapacity(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 1024}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	for _, tc := range []struct {
+		hash string
+		size int
+	}{
+		{hash: "a", size: 512},
+		{hash: "b", size: 64},
+		{hash: "c", size: 64},
+		{hash: "d", size: 512},
+	} {
+		request := requestWithHashes("request-"+tc.hash, map[string]int{tc.hash: tc.size})
+		require.NoError(t, producer.Produce(context.Background(), request, []scheduling.Endpoint{endpoint}))
+		require.NoError(t, producer.PreRequest(context.Background(), request, schedulingResult(endpoint)))
+		producer.ResponseBody(context.Background(), request, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	}
+
+	cache := producer.cacheSnapshot()
+	assert.NotContains(t, cache, "a")
+	assert.Contains(t, cache, "b")
+	assert.Contains(t, cache, "c")
+	assert.Contains(t, cache, "d")
+}
+
+func TestPreRequestPinsReferencedEntriesUntilResponseStarts(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 576}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	active := requestWithHashes("active", map[string]int{"active": 512})
+	require.NoError(t, producer.Produce(context.Background(), active, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), active, schedulingResult(endpoint)))
+
+	freeable := requestWithHashes("freeable", map[string]int{"freeable": 64})
+	require.NoError(t, producer.Produce(context.Background(), freeable, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), freeable, schedulingResult(endpoint)))
+	producer.ResponseBody(context.Background(), freeable, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+
+	replacement := requestWithHashes("replacement", map[string]int{"replacement": 64})
+	require.NoError(t, producer.Produce(context.Background(), replacement, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), replacement, schedulingResult(endpoint)))
+
+	cache := producer.cacheSnapshot()
+	assert.Contains(t, cache, "active")
+	assert.NotContains(t, cache, "freeable")
+	assert.Contains(t, cache, "replacement")
+}
+
+func TestPendingEntryCommitsAtStartOfStreamAfterCapacityBecomesFree(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	first := requestWithHashes("first", map[string]int{"first": 512})
+	require.NoError(t, producer.Produce(context.Background(), first, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), first, schedulingResult(endpoint)))
+
+	pending := requestWithHashes("pending", map[string]int{"pending": 512})
+	require.NoError(t, producer.Produce(context.Background(), pending, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), pending, schedulingResult(endpoint)))
+	assert.NotContains(t, producer.cacheSnapshot(), "pending")
+
+	producer.ResponseBody(context.Background(), first, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	producer.ResponseBody(context.Background(), pending, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+
+	cache := producer.cacheSnapshot()
+	assert.NotContains(t, cache, "first")
+	assert.Contains(t, cache, "pending")
+}
+
+func TestAbortedRequestDropsPendingEntry(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	active := requestWithHashes("active", map[string]int{"active": 512})
+	require.NoError(t, producer.Produce(context.Background(), active, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), active, schedulingResult(endpoint)))
+
+	pending := requestWithHashes("pending-abort", map[string]int{"pending": 512})
+	require.NoError(t, producer.Produce(context.Background(), pending, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), pending, schedulingResult(endpoint)))
+	producer.ResponseBody(context.Background(), pending, &requestcontrol.Response{
+		EndOfStream:      true,
+		TerminationCause: requestcontrol.TerminationCauseClientDisconnect,
+	}, endpoint.GetMetadata())
+
+	producer.ResponseBody(context.Background(), active, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	cache := producer.cacheSnapshot()
+	assert.Contains(t, cache, "active")
+	assert.NotContains(t, cache, "pending")
+}
+
+func TestSharedRequestReferencesProtectEntryUntilBothRelease(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	seed := requestWithHashes("seed", map[string]int{"shared": 512})
+	require.NoError(t, producer.Produce(context.Background(), seed, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), seed, schedulingResult(endpoint)))
+	producer.ResponseBody(context.Background(), seed, &requestcontrol.Response{StartOfStream: true, EndOfStream: true}, endpoint.GetMetadata())
+
+	first := requestWithHashes("first-reference", map[string]int{"shared": 512})
+	second := requestWithHashes("second-reference", map[string]int{"shared": 512})
+	for _, request := range []*scheduling.InferenceRequest{first, second} {
+		require.NoError(t, producer.Produce(context.Background(), request, []scheduling.Endpoint{endpoint}))
+		require.NoError(t, producer.PreRequest(context.Background(), request, schedulingResult(endpoint)))
+	}
+
+	replacement := requestWithHashes("replacement", map[string]int{"replacement": 512})
+	require.NoError(t, producer.Produce(context.Background(), replacement, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), replacement, schedulingResult(endpoint)))
+	assert.NotContains(t, producer.cacheSnapshot(), "replacement")
+
+	producer.ResponseBody(context.Background(), first, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	assert.Contains(t, producer.cacheSnapshot(), "shared")
+	producer.ResponseBody(context.Background(), second, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	producer.ResponseBody(context.Background(), replacement, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+
+	cache := producer.cacheSnapshot()
+	assert.NotContains(t, cache, "shared")
+	assert.Contains(t, cache, "replacement")
+}
+
+func TestPluginStateEvictionReleasesReferences(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	active := requestWithHashes("active", map[string]int{"active": 512})
+	require.NoError(t, producer.Produce(context.Background(), active, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), active, schedulingResult(endpoint)))
+	producer.pluginState.Delete(active.RequestID)
+	require.Eventually(t, func() bool {
+		producer.mutex.RLock()
+		defer producer.mutex.RUnlock()
+		return producer.caches[endpoint.GetMetadata().ID.String()].freeable.Len() == 1
+	}, time.Second, time.Millisecond)
+
+	replacement := requestWithHashes("replacement", map[string]int{"replacement": 512})
+	require.NoError(t, producer.Produce(context.Background(), replacement, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), replacement, schedulingResult(endpoint)))
+
+	cache := producer.cacheSnapshot()
+	assert.NotContains(t, cache, "active")
+	assert.Contains(t, cache, "replacement")
+}
+
+func TestPluginStateEvictionDoesNotBlockOnProducerLock(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+	request := requestWithHashes("active", map[string]int{"active": 512})
+	require.NoError(t, producer.Produce(context.Background(), request, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), request, schedulingResult(endpoint)))
+
+	producer.mutex.Lock()
+	done := make(chan struct{})
+	go func() {
+		producer.pluginState.Delete(request.RequestID)
+		close(done)
+	}()
+	returned := false
+	select {
+	case <-done:
+		returned = true
+	case <-time.After(time.Second):
+	}
+	producer.mutex.Unlock()
+	require.True(t, returned, "PluginState eviction must not wait for the producer lock")
+
+	require.Eventually(t, func() bool {
+		producer.mutex.RLock()
+		defer producer.mutex.RUnlock()
+		return producer.caches[endpoint.GetMetadata().ID.String()].freeable.Len() == 1
+	}, time.Second, time.Millisecond)
 }
 
 func TestStalePodCleanup(t *testing.T) {
