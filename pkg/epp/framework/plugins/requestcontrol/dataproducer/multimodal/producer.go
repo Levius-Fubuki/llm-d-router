@@ -348,57 +348,53 @@ func extractMMItems(request *scheduling.InferenceRequest) []attrmm.MatchItem {
 }
 
 func itemsFromGenerateFeatures(mmHashes map[string][]string) []attrmm.MatchItem {
-	itemsByHash := map[string]attrmm.MatchItem{}
-	for modality, hashes := range mmHashes {
+	collector := newItemCollector()
+	modalities := make([]string, 0, len(mmHashes))
+	for modality := range mmHashes {
+		modalities = append(modalities, modality)
+	}
+	sort.Strings(modalities)
+	for _, modality := range modalities {
+		hashes := mmHashes[modality]
 		for _, hash := range hashes {
-			addItem(itemsByHash, hash, modality)
+			collector.add(hash, modality, 1)
 		}
 	}
-	return itemSlice(itemsByHash)
+	return collector.items
 }
 
 func itemsFromTokenizedFeatures(features []fwkrh.MultiModalFeature) []attrmm.MatchItem {
-	itemsByHash := map[string]attrmm.MatchItem{}
+	collector := newItemCollector()
 	for _, feature := range features {
-		addTokenizedItem(itemsByHash, feature)
+		weight := feature.Length
+		if weight < 1 {
+			weight = 1
+		}
+		collector.add(feature.Hash, string(feature.Modality), weight)
 	}
-	return itemSlice(itemsByHash)
-}
-
-func addTokenizedItem(itemsByHash map[string]attrmm.MatchItem, feature fwkrh.MultiModalFeature) {
-	if feature.Hash == "" {
-		return
-	}
-	if _, exists := itemsByHash[feature.Hash]; exists {
-		return
-	}
-	weight := 1
-	if feature.Length > 0 {
-		weight = feature.Length
-	}
-	itemsByHash[feature.Hash] = attrmm.MatchItem{Hash: feature.Hash, Size: weight, Modality: string(feature.Modality)}
+	return collector.items
 }
 
 func itemsFromChat(request *fwkrh.ChatCompletionsRequest) []attrmm.MatchItem {
-	itemsByHash := map[string]attrmm.MatchItem{}
+	collector := newItemCollector()
 	for _, message := range request.Messages {
 		for _, block := range message.Content.Structured {
-			addBlockItem(itemsByHash, block)
+			addBlockItem(collector, block)
 		}
 	}
-	return itemSlice(itemsByHash)
+	return collector.items
 }
 
-func addBlockItem(itemsByHash map[string]attrmm.MatchItem, block fwkrh.ContentBlock) {
+func addBlockItem(collector *itemCollector, block fwkrh.ContentBlock) {
 	switch {
 	case block.ImageURL.URL != "":
-		addItem(itemsByHash, contentHash("image_url", block.ImageURL.URL), string(fwkrh.ModalityImage))
+		collector.add(contentHash("image_url", block.ImageURL.URL), string(fwkrh.ModalityImage), 1)
 	case block.VideoURL.URL != "":
-		addItem(itemsByHash, contentHash("video_url", block.VideoURL.URL), string(fwkrh.ModalityVideo))
+		collector.add(contentHash("video_url", block.VideoURL.URL), string(fwkrh.ModalityVideo), 1)
 	case block.AudioURL.URL != "":
-		addItem(itemsByHash, contentHash("audio_url", block.AudioURL.URL), string(fwkrh.ModalityAudio))
+		collector.add(contentHash("audio_url", block.AudioURL.URL), string(fwkrh.ModalityAudio), 1)
 	case block.InputAudio.Data != "":
-		addItem(itemsByHash, contentHash("input_audio", block.InputAudio.Format+":"+block.InputAudio.Data), string(fwkrh.ModalityAudio))
+		collector.add(contentHash("input_audio", block.InputAudio.Format+":"+block.InputAudio.Data), string(fwkrh.ModalityAudio), 1)
 	}
 }
 
@@ -407,14 +403,24 @@ func contentHash(kind, identifier string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func addItem(itemsByHash map[string]attrmm.MatchItem, hash, modality string) {
+type itemCollector struct {
+	items []attrmm.MatchItem
+	seen  map[string]struct{}
+}
+
+func newItemCollector() *itemCollector {
+	return &itemCollector{seen: make(map[string]struct{})}
+}
+
+func (c *itemCollector) add(hash, modality string, size int) {
 	if hash == "" {
 		return
 	}
-	if _, exists := itemsByHash[hash]; exists {
+	if _, exists := c.seen[hash]; exists {
 		return
 	}
-	itemsByHash[hash] = attrmm.MatchItem{Hash: hash, Size: 1, Modality: modality}
+	c.seen[hash] = struct{}{}
+	c.items = append(c.items, attrmm.MatchItem{Hash: hash, Size: size, Modality: modality})
 }
 
 func itemSlice(itemsByHash map[string]attrmm.MatchItem) []attrmm.MatchItem {

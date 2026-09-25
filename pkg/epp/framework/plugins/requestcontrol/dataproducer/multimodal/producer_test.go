@@ -96,7 +96,7 @@ func TestExtractMMItemsFromTokenizedRequestUsesPlaceholderLengths(t *testing.T) 
 		},
 	})
 
-	assert.ElementsMatch(t, []attrmm.MatchItem{
+	assert.Equal(t, []attrmm.MatchItem{
 		{Hash: "image-a", Size: 576, Modality: string(fwkrh.ModalityImage)},
 		{Hash: "image-b", Size: 1, Modality: string(fwkrh.ModalityImage)},
 	}, items)
@@ -132,7 +132,7 @@ func TestExtractMMItemsFromTokenizedRequestFallsBackToUnitWeight(t *testing.T) {
 		},
 	})
 
-	assert.ElementsMatch(t, []attrmm.MatchItem{
+	assert.Equal(t, []attrmm.MatchItem{
 		{Hash: "image-a", Size: 1, Modality: string(fwkrh.ModalityImage)},
 		{Hash: "image-b", Size: 1, Modality: string(fwkrh.ModalityAudio)},
 	}, items)
@@ -153,10 +153,10 @@ func TestExtractMMItemsFromGenerateFeatures(t *testing.T) {
 		},
 	})
 
-	assert.ElementsMatch(t, []attrmm.MatchItem{
+	assert.Equal(t, []attrmm.MatchItem{
+		{Hash: "audio-x", Size: 1, Modality: "audio"},
 		{Hash: "image-a", Size: 1, Modality: "image"},
 		{Hash: "image-b", Size: 1, Modality: "image"},
-		{Hash: "audio-x", Size: 1, Modality: "audio"},
 	}, items)
 }
 
@@ -190,7 +190,7 @@ func TestExtractMMItemsFromStructuredChatMedia(t *testing.T) {
 		},
 	})
 
-	assert.ElementsMatch(t, []attrmm.MatchItem{
+	assert.Equal(t, []attrmm.MatchItem{
 		{Hash: contentHash("image_url", "https://example.com/cat.png"), Size: 1, Modality: string(fwkrh.ModalityImage)},
 	}, items)
 }
@@ -211,7 +211,7 @@ func TestExtractMMItemsFromStructuredChatAudioURL(t *testing.T) {
 		},
 	})
 
-	assert.ElementsMatch(t, []attrmm.MatchItem{
+	assert.Equal(t, []attrmm.MatchItem{
 		{Hash: contentHash("audio_url", audioURL), Size: 1, Modality: string(fwkrh.ModalityAudio)},
 		{Hash: contentHash("input_audio", "wav:AAAA"), Size: 1, Modality: string(fwkrh.ModalityAudio)},
 	}, items)
@@ -295,6 +295,32 @@ func TestWeightedEvictionUsesEncoderEmbeddingCapacity(t *testing.T) {
 	assert.Contains(t, cache, "d")
 }
 
+func TestWeightedEvictionPreservesRequestItemOrder(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+	request := &scheduling.InferenceRequest{
+		RequestID: "ordered-items",
+		Body: &fwkrh.InferenceRequestBody{
+			TokenizedRequest: &fwkrh.TokenizedRequest{
+				Prompts: []fwkrh.PromptTokens{{
+					MultiModalFeatures: []fwkrh.MultiModalFeature{
+						{Modality: fwkrh.ModalityImage, Hash: "first", Length: 512},
+						{Modality: fwkrh.ModalityImage, Hash: "second", Length: 512},
+					},
+				}},
+			},
+		},
+	}
+
+	require.NoError(t, producer.Produce(context.Background(), request, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), request, schedulingResult(endpoint)))
+	producer.ResponseBody(context.Background(), request, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+
+	cache := producer.cacheSnapshot()
+	assert.NotContains(t, cache, "first")
+	assert.Contains(t, cache, "second")
+}
+
 func TestPreRequestPinsReferencedEntriesUntilResponseStarts(t *testing.T) {
 	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 576}, nil)
 	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
@@ -332,7 +358,11 @@ func TestPendingEntryCommitsAtStartOfStreamAfterCapacityBecomesFree(t *testing.T
 	assert.NotContains(t, producer.cacheSnapshot(), "pending")
 
 	producer.ResponseBody(context.Background(), first, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
-	producer.ResponseBody(context.Background(), pending, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	producer.ResponseBody(context.Background(), pending, &requestcontrol.Response{
+		StartOfStream:    true,
+		EndOfStream:      true,
+		TerminationCause: requestcontrol.TerminationCauseNatural,
+	}, endpoint.GetMetadata())
 
 	cache := producer.cacheSnapshot()
 	assert.NotContains(t, cache, "first")
@@ -361,6 +391,29 @@ func TestAbortedRequestDropsPendingEntry(t *testing.T) {
 	assert.NotContains(t, cache, "pending")
 }
 
+func TestAbortedRequestWithSyntheticStartOfStreamDropsPendingEntry(t *testing.T) {
+	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
+	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
+
+	active := requestWithHashes("active", map[string]int{"active": 512})
+	require.NoError(t, producer.Produce(context.Background(), active, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), active, schedulingResult(endpoint)))
+
+	pending := requestWithHashes("pending-abort", map[string]int{"pending": 512})
+	require.NoError(t, producer.Produce(context.Background(), pending, []scheduling.Endpoint{endpoint}))
+	require.NoError(t, producer.PreRequest(context.Background(), pending, schedulingResult(endpoint)))
+	producer.ResponseBody(context.Background(), active, &requestcontrol.Response{StartOfStream: true}, endpoint.GetMetadata())
+	producer.ResponseBody(context.Background(), pending, &requestcontrol.Response{
+		StartOfStream:    true,
+		EndOfStream:      true,
+		TerminationCause: requestcontrol.TerminationCauseClientDisconnect,
+	}, endpoint.GetMetadata())
+
+	cache := producer.cacheSnapshot()
+	assert.Contains(t, cache, "active")
+	assert.NotContains(t, cache, "pending")
+}
+
 func TestSharedRequestReferencesProtectEntryUntilBothRelease(t *testing.T) {
 	producer := newTestProducer(t, &Parameters{CacheSizeInEmbeddingsPerServer: 512}, nil)
 	endpoint := newEndpoint(k8stypes.NamespacedName{Namespace: "default", Name: "pod-a"})
@@ -368,7 +421,11 @@ func TestSharedRequestReferencesProtectEntryUntilBothRelease(t *testing.T) {
 	seed := requestWithHashes("seed", map[string]int{"shared": 512})
 	require.NoError(t, producer.Produce(context.Background(), seed, []scheduling.Endpoint{endpoint}))
 	require.NoError(t, producer.PreRequest(context.Background(), seed, schedulingResult(endpoint)))
-	producer.ResponseBody(context.Background(), seed, &requestcontrol.Response{StartOfStream: true, EndOfStream: true}, endpoint.GetMetadata())
+	producer.ResponseBody(context.Background(), seed, &requestcontrol.Response{
+		StartOfStream:    true,
+		EndOfStream:      true,
+		TerminationCause: requestcontrol.TerminationCauseNatural,
+	}, endpoint.GetMetadata())
 
 	first := requestWithHashes("first-reference", map[string]int{"shared": 512})
 	second := requestWithHashes("second-reference", map[string]int{"shared": 512})
