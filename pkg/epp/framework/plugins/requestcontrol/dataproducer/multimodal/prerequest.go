@@ -174,8 +174,9 @@ func (p *Producer) cacheItem(item attrmm.MatchItem) attrmm.MatchItem {
 }
 
 // ResponseBody releases active encoder-cache references when prefill has
-// completed. A request that ends before its first response chunk releases its
-// references without committing items that could not be reserved.
+// completed. The director marks an abort before the first response chunk as
+// both StartOfStream and EndOfStream, so only a natural one-chunk response may
+// commit pending items on that combined callback.
 func (p *Producer) ResponseBody(
 	_ context.Context,
 	request *scheduling.InferenceRequest,
@@ -187,7 +188,9 @@ func (p *Producer) ResponseBody(
 	}
 	state, err := plugin.ReadPluginStateKey[*placementState](p.pluginState, request.RequestID, plugin.StateKey(ProducerType))
 	if err == nil {
-		if response.StartOfStream {
+		commitPending := response.StartOfStream &&
+			(!response.EndOfStream || response.TerminationCause == requestcontrol.TerminationCauseNatural)
+		if commitPending {
 			state.complete(request.RequestID, true)
 		} else if response.EndOfStream {
 			state.complete(request.RequestID, false)
